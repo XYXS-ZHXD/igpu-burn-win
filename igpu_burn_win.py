@@ -340,26 +340,52 @@ def detect_all_gpus() -> list:
     gpus = []
 
     if IS_WINDOWS:
+        print("\n  🔍 正在检测 GPU...")
         try:
             out = subprocess.check_output(
                 ["wmic", "path", "win32_VideoController", "get",
                  "Name,AdapterCompatibility", "/format:csv"],
-                text=True, timeout=10, stderr=subprocess.DEVNULL
+                text=True, timeout=10, stderr=subprocess.STDOUT
             )
             lines = [l.strip() for l in out.splitlines()
                      if l.strip() and "Node" not in l and "Name" not in l]
-
+            
+            print(f"  📋 WMIC 检测到 {len(lines)} 个设备:")
+            for i, line in enumerate(lines):
+                print(f"     [{i}] {line[:100]}")
+            
             for line in lines:
                 parts = line.split(",")
                 if len(parts) >= 3:
                     compat = parts[1].lower()
                     name = parts[2].strip()
-
                     gpu = _make_gpu_entry(name, compat)
                     if gpu:
                         gpus.append(gpu)
-        except Exception:
-            pass
+                        print(f"  ✅ 识别: {gpu['name']} ({gpu['vendor']})")
+                    else:
+                        print(f"  ⚠️  跳过未知设备: {name}")
+        except FileNotFoundError as e:
+            print(f"  ❌ WMIC 未找到: {e}")
+            print(f"     尝试使用 PowerShell 备用检测...")
+            try:
+                ps_result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", 
+                     "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+                    capture_output=True, text=True, timeout=15
+                )
+                if ps_result.returncode == 0 and ps_result.stdout.strip():
+                    names = [n.strip() for n in ps_result.stdout.strip().splitlines() if n.strip()]
+                    print(f"  📋 PowerShell 检测到: {names}")
+                    for name in names:
+                        if name:
+                            gpu = _make_gpu_entry(name, "")
+                            if gpu:
+                                gpus.append(gpu)
+            except Exception as ps_e:
+                print(f"  ⚠️  PowerShell 也失败: {ps_e}")
+        except Exception as e:
+            print(f"  ❌ WMIC 检测失败: {e}")
 
     # macOS 备用
     if not gpus and platform.system() == "Darwin":
@@ -412,6 +438,16 @@ def detect_all_gpus() -> list:
     for gpu in gpus:
         _verify_ffmpeg_encoder(gpu)
 
+    if not gpus:
+        print("\n  ❌ 未检测到任何 GPU！")
+        print(f"     诊断建议:")
+        print(f"       1. 打开设备管理器查看显卡状态")
+        print(f"       2. 更新显卡驱动")
+        print(f"       3. 以管理员身份运行程序")
+        print(f"       4. 运行 'wmic path win32_VideoController get Name' 手动检测")
+    else:
+        print(f"\n  ✅ GPU 检测完成，共 {len(gpus)} 个显卡")
+    
     return gpus
 
 
@@ -1139,7 +1175,7 @@ def monitor_worker(duration: int, gpu_info: dict):
         type_icon = "🟢" if gpu_info.get("type") == "dedicated" else "🔵"
 
         print("=" * 72)
-        print(f"  🔥 GPU 烤机程序 v3.5  [{now_str}]")
+        print(f"  🔥 GPU 烤机程序 v3.6  [{now_str}]")
         print(f"  {type_icon} {icon} GPU: {gpu_info.get('name', 'Unknown')[:50]}")
         print(f"  厂商: {vendor} | 类型: {gpu_info.get('type', 'unknown')}")
         print(f"  ⚡ 加速模式: {gpu_info.get('label', 'Unknown')}")
@@ -1216,7 +1252,7 @@ def monitor_worker(duration: int, gpu_info: dict):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="GPU 烤机程序 v3.5 - 支持 Intel QSV / AMD AMF / NVIDIA NVENC",
+        description="GPU 烤机程序 v3.6 - 支持 Intel QSV / AMD AMF / NVIDIA NVENC",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 示例：
@@ -1340,7 +1376,7 @@ def main():
 
     # ── 打印启动信息 ─────────────────────────────────────────────
     print("=" * 72)
-    print("  🔥 GPU 烤机程序 v3.5 启动")
+    print("  🔥 GPU 烤机程序 v3.6 启动")
     print("=" * 72)
     type_icon = "🟢" if gpu_info.get("type") == "dedicated" else "🔵"
     vendor_icon = {"Intel": "🔵", "AMD": "🔴", "NVIDIA": "🟢",
