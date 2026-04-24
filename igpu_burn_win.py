@@ -3,14 +3,14 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║         iGPU / dGPU 烤机程序 - Windows 版                       ║
-║         支持 Intel QSV / AMD AMF / NVIDIA NVENC                 ║
+║         支持 Intel / AMD / NVIDIA 全显卡                          ║
 ║         支持独立显卡: NVIDIA dGPU / AMD dGPU                     ║
 ║                                                                ║
 ║  压力来源：                                                     ║
-║    1. GPU 编码 —— FFmpeg + QSV/AMF/NVENC 多路并发硬件转码       ║
+║    1. OpenGL 3D —— GLSL 计算着色器（主力，适用所有显卡）        ║
 ║    2. GPU 计算 —— CUDA (NVIDIA) / OpenCL (AMD/NVIDIA) 通用计算  ║
 ║    3. CPU 计算 —— numpy 矩阵爆算 (备用/补充)                    ║
-║    4. OpenGL 3D —— GLSL 计算着色器 (可选)                       ║
+║    4. GPU 编码 —— FFmpeg 硬件加速（QSV/NVENC/AMF）              ║
 ║                                                                ║
 ║  用法：                                                         ║
 ║    igpu_burn_win.exe [选项]                                     ║
@@ -47,12 +47,36 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+# ── 可选依赖 ──────────────────────────────────────────────────────
+HAS_NUMPY = False
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    pass
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+# PyOpenGL / GLFW：静态导入，确保 PyInstaller 打包
+HAS_OPENGL = False
 try:
     import OpenGL.GL as GL
-    import OpenGL.GLUT as GLUT
     HAS_OPENGL = True
 except ImportError:
-    HAS_OPENGL = False
+    pass
+
+HAS_GLFW = False
+GLFW = None
+try:
+    import glfw as _glfw
+    GLFW = _glfw
+    HAS_GLFW = True
+except ImportError:
+    pass
 
 # ── 全局状态 ──────────────────────────────────────────────────────
 STOP_EVENT = threading.Event()
@@ -315,15 +339,14 @@ def _verify_ffmpeg_encoder(gpu_info: dict):
 
         if proc.returncode != 0:
             if hw == "qsv":
-                if any(k in stderr_text for k in ["qsv", "mfx", "intel", "vaapi"]):
-                    gpu_info["label"] += (
-                        "（QSV 初始化失败，可能原因：\n"
-                        "     ① Intel 显卡驱动版本过低或未正确安装\n"
-                        "     ② FFmpeg 打包版本不含 QSV/MediaSDK 支持\n"
-                        "     ③ 未安装 Intel Media SDK Runtime\n"
-                        "     已回退到软件编码（libx265），GPU 编码压力将降低")
-                else:
-                    gpu_info["label"] += "（QSV 硬件加速不可用，已回退到软件编码）"
+                gpu_info["label"] += (
+                    "（⚠️  Intel QSV 不可用 — 标准 FFmpeg 不含 QSV 支持\n"
+                    "     这是业界限制，不是你的问题！\n"
+                    "     QSV 需要用 Intel Media SDK 专门编译 FFmpeg。\n"
+                    "     建议改用 --no-media 让 OpenGL 3D 方式烤机，\n"
+                    "     GLSL 着色器持续渲染同样可以有效烤 Intel 核显。\n"
+                    "     程序已默认开启 OpenGL 压力，会持续渲染 GPU 执行单元。\n"
+                    "     GPU 温度和利用率由 FFmpeg 媒体编码部分改为 CPU 承担。")
             elif hw == "cuda":
                 gpu_info["label"] += (
                     "（NVENC 初始化失败，可能原因：\n"
@@ -745,25 +768,28 @@ void main() {
 def opengl_worker(worker_id: int, width: int = 1920, height: int = 1080):
     """
     OpenGL + GLSL 着色器持续渲染，压榨 GPU 3D 单元。
+    PyInstaller 打包时需 --collect-all PyOpenGL。
     """
-    if not HAS_OPENGL:
-        compute_worker(worker_id + 100, matrix_size=1536)
+    if not HAS_OPENGL or not HAS_GLFW:
+        if HAS_NUMPY:
+            compute_worker(worker_id + 100, matrix_size=1536)
         return
 
     try:
-        import glfw
-        if not glfw.init():
-            compute_worker(worker_id + 100, matrix_size=1536)
+        if not GLFW.init():
+            if HAS_NUMPY:
+                compute_worker(worker_id + 100, matrix_size=1536)
             return
 
-        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
-        window = glfw.create_window(width, height, f"IGPUBurn-{worker_id}", None, None)
+        GLFW.window_hint(GLFW.VISIBLE, GLFW.FALSE)
+        window = GLFW.create_window(width, height, f"IGPUBurn-{worker_id}", None, None)
         if not window:
-            glfw.terminate()
-            compute_worker(worker_id + 100, matrix_size=1536)
+            GLFW.terminate()
+            if HAS_NUMPY:
+                compute_worker(worker_id + 100, matrix_size=1536)
             return
 
-        glfw.make_context_current(window)
+        GLFW.make_context_current(window)
 
         def _compile(src, shader_type):
             s = GL.glCreateShader(shader_type)
@@ -797,21 +823,22 @@ def opengl_worker(worker_id: int, width: int = 1920, height: int = 1080):
             STATS["gl_workers"] += 1
 
         t0 = time.time()
-        while not STOP_EVENT.is_set() and not glfw.window_should_close(window):
+        while not STOP_EVENT.is_set() and not GLFW.window_should_close(window):
             GL.glUniform1f(loc_time, time.time() - t0)
             GL.glClear(GL.GL_COLOR_BUFFER_BIT)
             GL.glBindVertexArray(vao)
             GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
-            glfw.swap_buffers(window)
-            glfw.poll_events()
+            GLFW.swap_buffers(window)
+            GLFW.poll_events()
             with STATS_LOCK:
                 STATS["total_frames"] += 1
 
-        glfw.terminate()
+        GLFW.terminate()
     except Exception:
         with STATS_LOCK:
             STATS["errors"] += 1
-        compute_worker(worker_id + 100, matrix_size=1536)
+        if HAS_NUMPY:
+            compute_worker(worker_id + 100, matrix_size=1536)
     finally:
         with STATS_LOCK:
             if STATS["gl_workers"] > 0:
