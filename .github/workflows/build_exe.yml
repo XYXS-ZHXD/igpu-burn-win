@@ -1,0 +1,80 @@
+name: 🔥 Build Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - name: 📥 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 🐍 设置 Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: 📦 安装依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller numpy psutil PyOpenGL PyOpenGL-accelerate glfw
+    
+    - name: 🔨 编译 EXE
+      run: |
+        pyinstaller `
+          --onefile `
+          --console `
+          --name "igpu_burn_win" `
+          --hidden-import numpy `
+          --hidden-import psutil `
+          --collect-all numpy `
+          igpu_burn_win.py
+      
+    - name: ✅ 验证 EXE
+      run: |
+        if (Test-Path dist\igpu_burn_win.exe) {
+          $fileSize = (Get-Item dist\igpu_burn_win.exe).Length / 1MB
+          Write-Host "✅ EXE 生成成功！文件大小：$([math]::Round($fileSize, 2)) MB"
+        } else {
+          Write-Host "❌ EXE 生成失败！"
+          exit 1
+        }
+    
+    - name: 📤 上传 EXE (Workflow Artifact)
+      uses: actions/upload-artifact@v4
+      with:
+        name: igpu_burn_win
+        path: dist/igpu_burn_win.exe
+        retention-days: 30
+    
+    - name: 📦 上传到 Release (仅标签推送)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/igpu_burn_win.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: 📂 复制 EXE 到仓库 (仅 main 分支)
+      if: github.ref == 'refs/heads/main'
+      run: |
+        Copy-Item dist\igpu_burn_win.exe releases\igpu_burn_win.exe -Force
+        Write-Host "✅ EXE 已复制到 releases/ 目录"
+    
+    - name: 💾 提交 EXE 到仓库 (仅 main 分支)
+      if: github.ref == 'refs/heads/main'
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add releases/igpu_burn_win.exe
+        git commit -m "🔨 [CI/CD] 自动构建 EXE - ${{ github.sha }}" || echo "无变更"
+        git push
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
