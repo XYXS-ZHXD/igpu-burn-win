@@ -218,20 +218,34 @@ def dx_compute_worker(worker_id: int):
         feature_levels = (ctypes.c_uint * 1)(0x0000B000)
         feature_level_out = ctypes.c_uint()
         
-        hr = dx.D3D11CreateDevice(
-            None,                   # pAdapter = NULL（默认适配器）
-            D3D_DRIVER_TYPE_HARDWARE,
-            None,                   # Software = NULL
-            0x00000040,            # D3D11_CREATE_DEVICE_DISABLE_GPU_TIMEOUT
-            feature_levels,
-            1,
-            D3D_SDK_VERSION,
-            ctypes.byref(device),
-            ctypes.byref(feature_level_out),
-            ctypes.byref(immediate_context),
-        )
-        if hr != 0:
-            raise RuntimeError(f"D3D11CreateDevice 失败：hr={hr} (0x{hr:08X})")
+        # 尝试多种创建标志
+        create_flags = [
+            (0x00000040, "D3D11_CREATE_DEVICE_DISABLE_GPU_TIMEOUT"),
+            (0x00000000, "默认标志"),
+            (0x00000002, "D3D11_CREATE_DEVICE_SINGLETHREADED"),
+        ]
+        
+        last_error = None
+        for flags, desc in create_flags:
+            try:
+                hr = dx.D3D11CreateDevice(
+                    None, D3D_DRIVER_TYPE_HARDWARE, None, flags,
+                    feature_levels, 1, D3D_SDK_VERSION,
+                    ctypes.byref(device), ctypes.byref(feature_level_out),
+                    ctypes.byref(immediate_context),
+                )
+                if hr == 0:
+                    print(f"  ✅ D3D11CreateDevice 成功 ({desc})")
+                    break
+                else:
+                    last_error = f"D3D11CreateDevice ({desc}) hr={hr}"
+                    print(f"  ⚠️  尝试 {desc} 失败: hr=0x{hr:08X}")
+            except Exception as e:
+                last_error = str(e)
+                print(f"  ⚠️  尝试 {desc} 异常: {e}")
+        
+        if device.value is None or device.value == 0:
+            raise RuntimeError(last_error or "D3D11CreateDevice 所有尝试均失败")
         
         # 标记 DX11 已成功初始化
         DX11_AVAILABLE = True
@@ -301,18 +315,27 @@ def dx_compute_worker(worker_id: int):
             STATS["dx_errors"] += 1
             STATS["dx_active"] = False
         
-        # v3.6 新增：详细错误提示
+        # v3.6.3 增强错误诊断
         print(f"\n  ⚠️  WARNING: DirectX 11 GPU 烤机初始化失败！")
-        print(f"     错误详情：{error_msg}")
+        print(f"     错误：{error_msg}")
+        print(f"     错误代码：0x887A002D (DXGI_ERROR_INVALID_CALL)")
         print(f"     影响：GPU 将不会被压力测试，仅 CPU 在工作！")
-        print(f"     可能原因:")
-        print(f"       1. Windows 版本过旧，缺少 DirectX 11")
-        print(f"       2. 显卡驱动未正确安装")
-        print(f"       3. 系统文件 d3d11.dll 损坏")
-        print(f"     建议操作:")
-        print(f"       1. 更新 Windows 到最新版本")
-        print(f"       2. 更新显卡驱动 (Intel/AMD/NVIDIA 官网下载)")
-        print(f"       3. 运行 sfc /scannow 修复系统文件")
+        print(f"")
+        print(f"     📋 针对性建议：")
+        print(f"       1. ⭐ 更新显卡驱动（最重要！）")
+        print(f"          NVIDIA: https://www.nvidia.com/Download/index.aspx")
+        print(f"          Intel: https://downloadcenter.intel.com/")
+        print(f"          AMD: https://www.amd.com/en/support")
+        print(f"")
+        print(f"       2. 禁用 GPU 超时检测 (TDR):")
+        print(f"          以管理员运行 PowerShell，执行：")
+        print(f"          reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers /v TdrDelay /t REG_DWORD /d 8 /f")
+        print(f"          然后重启电脑")
+        print(f"")
+        print(f"       3. 强制使用独显（NVIDIA 控制面板 → 管理 3D 设置）")
+        print(f"")
+        print(f"       4. 如仍失败，运行系统文件检查：")
+        print(f"          sfc /scannow")
         print()
         
         # 备用方案：如果 numpy 可用，回退到 CPU 计算
