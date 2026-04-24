@@ -442,11 +442,13 @@ def detect_all_gpus() -> list:
         print("\n  ❌ 未检测到任何 GPU！")
         print(f"     诊断建议:")
         print(f"       1. 打开设备管理器查看显卡状态")
-        print(f"       2. 更新显卡驱动")
+        print(f"       2. 更新显卡驱动 (Intel/AMD/NVIDIA 官网)")
         print(f"       3. 以管理员身份运行程序")
-        print(f"       4. 运行 'wmic path win32_VideoController get Name' 手动检测")
+        print(f"       4. 手动运行 PowerShell 命令测试:")
+        print(f"          Get-CimInstance Win32_VideoController")
     else:
         print(f"\n  ✅ GPU 检测完成，共 {len(gpus)} 个显卡")
+        print(f"     将使用：{gpus[0]['name']} ({gpus[0]['vendor']})")
     
     return gpus
 
