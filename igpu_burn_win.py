@@ -129,6 +129,34 @@ def detect_all_gpus() -> list:
         except Exception:
             pass
 
+    # 先打印 FFmpeg 编码器支持列表，帮助诊断问题
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        hw_encoders = ["h264_qsv", "hevc_qsv", "h264_nvenc", "hevc_nvenc",
+                       "h264_amf", "hevc_amf", "h264_videotoolbox", "hevc_videotoolbox",
+                       "h264_vaapi", "hevc_vaapi", "h264_v4l2m2m", "hevc_v4l2m2m",
+                       "libx264", "libx265"]
+        try:
+            enc_out = subprocess.check_output(
+                [ffmpeg, "-hide_banner", "-encoders"],
+                text=True, timeout=10, stderr=subprocess.DEVNULL
+            )
+            found_hw = [e for e in hw_encoders if e in enc_out]
+            found_sw = [e for e in ["libx264", "libx265", "libx264", "libx265"]
+                        if e in enc_out]
+            print(f"\n  🔧 FFmpeg 编码器支持：")
+            print(f"     {' '.join(found_hw) if found_hw else '无硬件编码器'}")
+            if not found_hw:
+                print(f"     ⚠️  FFmpeg 不含任何硬件编码器！")
+                print(f"     💡 建议下载含硬件加速的 FFmpeg：")
+                print(f"         https://github.com/BtbN/FFmpeg-Builds/releases")
+                print(f"         下载 ffmpeg-master-latest-win64-gpl.zip（勾选 hwaccel）")
+        except Exception:
+            pass
+    else:
+        print(f"\n  ⚠️  FFmpeg 未找到！请下载并放到程序同目录：")
+        print(f"     https://github.com/BtbN/FFmpeg-Builds/releases")
+
     # 验证所有 GPU 的 FFmpeg 编码器
     for gpu in gpus:
         _verify_ffmpeg_encoder(gpu)
