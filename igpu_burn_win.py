@@ -75,6 +75,41 @@ STATS_LOCK = threading.Lock()
 IS_WINDOWS = platform.system() == "Windows"
 
 
+def find_ffmpeg() -> str:
+    """
+    查找 ffmpeg 路径，优先级：
+    1. EXE 同目录的 ffmpeg.exe（最优先，用于用户手动放置的情况）
+    2. PATH 中的 ffmpeg
+    3. 返回 "ffmpeg" 让系统 PATH 处理
+    """
+    # 1. 检查 EXE/Python 脚本同目录
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包的 EXE
+        exe_dir = os.path.dirname(sys.executable)
+    else:
+        # 直接运行 Python 脚本
+        exe_dir = os.path.dirname(os.path.abspath(__file__))
+
+    local_ffmpeg = os.path.join(exe_dir, "ffmpeg.exe")
+    if os.path.isfile(local_ffmpeg):
+        print(f"\n  ✅ 找到同目录 ffmpeg.exe: {local_ffmpeg}")
+        return local_ffmpeg
+
+    # 2. 尝试 PATH 中的 ffmpeg
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    # 3. Windows 上也试试无扩展名
+    if IS_WINDOWS:
+        for name in ["ffmpeg.exe", "ffmpeg"]:
+            found = shutil.which(name)
+            if found:
+                return found
+
+    return "ffmpeg"  # 返回命令名，让 subprocess 自己去 PATH 找
+
+
 # ══════════════════════════════════════════════════════════════════
 # 模块 0：GPU 自动检测（支持多卡）
 # ══════════════════════════════════════════════════════════════════
@@ -130,7 +165,7 @@ def detect_all_gpus() -> list:
             pass
 
     # 先打印 FFmpeg 编码器支持列表，帮助诊断问题
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = find_ffmpeg()
     if ffmpeg:
         hw_encoders = ["h264_qsv", "hevc_qsv", "h264_nvenc", "hevc_nvenc",
                        "h264_amf", "hevc_amf", "h264_videotoolbox", "hevc_videotoolbox",
@@ -242,7 +277,7 @@ def _verify_ffmpeg_encoder(gpu_info: dict):
     验证 FFmpeg 是否真的支持检测到的硬件编码器，不支持则回退。
     增加详细诊断：区分"编码器未编译"和"硬件设备初始化失败"两种情况。
     """
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = find_ffmpeg()
     if not ffmpeg:
         gpu_info["label"] += "（FFmpeg 未找到，将使用软件编码）"
         return
@@ -792,7 +827,7 @@ def build_ffmpeg_cmd(stream_id: int, gpu_info: dict, codec: str,
     """
     根据 GPU 类型构建对应的 FFmpeg 硬件加速命令。
     """
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    ffmpeg = find_ffmpeg() or "ffmpeg"
     null_output = "NUL" if IS_WINDOWS else "/dev/null"
     hw = gpu_info.get("hwaccel")
     target_bitrate = "50M" if bitrate == "0" else bitrate
@@ -1179,7 +1214,7 @@ def main():
         print(f"  H.264 编码: {gpu_info['encoder_h264']}")
         print(f"  HEVC 编码:  {gpu_info['encoder_hevc']}")
         print(f"  加速模式:   {gpu_info['hwaccel'] or '无'}")
-        print(f"  FFmpeg:    {shutil.which('ffmpeg') or '未找到'}")
+        print(f"  FFmpeg:    {find_ffmpeg() or '未找到'}")
         print(f"  nvidia-smi: {shutil.which('nvidia-smi') or '未找到'}")
         print(f"  numpy:     {'可用 ' + np.__version__ if HAS_NUMPY else '未安装'}")
         print(f"  psutil:    {'可用 ' + psutil.__version__ if HAS_PSUTIL else '未安装'}")
@@ -1205,7 +1240,7 @@ def main():
     compute_threads = args.compute_threads if args.compute_threads > 0 else num_cpu
 
     # ── 检查工具 ──────────────────────────────────────────────────
-    has_ffmpeg = bool(shutil.which("ffmpeg"))
+    has_ffmpeg = bool(find_ffmpeg())
     has_nvidia_smi = bool(shutil.which("nvidia-smi"))
 
     # ── 打印启动信息 ─────────────────────────────────────────────
