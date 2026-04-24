@@ -210,7 +210,10 @@ def _make_gpu_entry(name: str, compat: str) -> dict:
 
 
 def _verify_ffmpeg_encoder(gpu_info: dict):
-    """验证 FFmpeg 是否真的支持检测到的硬件编码器，不支持则回退"""
+    """
+    验证 FFmpeg 是否真的支持检测到的硬件编码器，不支持则回退。
+    增加详细诊断：区分"编码器未编译"和"硬件设备初始化失败"两种情况。
+    """
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         gpu_info["label"] += "（FFmpeg 未找到，将使用软件编码）"
@@ -220,20 +223,62 @@ def _verify_ffmpeg_encoder(gpu_info: dict):
     if hevc_enc in ("libx265", "libx264"):
         return  # 软件编码无需验证
 
-    try:
-        test_cmd = _build_test_cmd(ffmpeg, hevc_enc, gpu_info.get("hwaccel"))
-        proc = subprocess.run(test_cmd, timeout=15,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        stderr_text = proc.stderr.decode(errors="ignore")
+    hw = gpu_info.get("hwaccel")
+    encoder = hevc_enc
 
-        if proc.returncode != 0 and any(k in stderr_text.lower()
-                                         for k in ["not found", "encoder",
-                                                   "unknown", "unsupported"]):
-            print(f"  ⚠️  {hevc_enc} 不可用，回退到软件编码")
+    # 先检查 FFmpeg 是否真的编译了该编码器（--encoders 过滤）
+    try:
+        enc_check = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10
+        )
+        encoder_found = encoder in enc_check.stdout or \
+                        encoder.replace("_", " ") in enc_check.stdout
+        if not encoder_found:
+            gpu_info["label"] += (f"（FFmpeg 未编译 {encoder}，将使用软件编码）")
             gpu_info["encoder_h264"] = "libx264"
             gpu_info["encoder_hevc"] = "libx265"
             gpu_info["hwaccel"] = None
-            gpu_info["label"] += "（硬件加速不可用，已回退软件编码）"
+            return
+    except Exception:
+        pass
+
+    # 再验证编码器实际运行能力
+    try:
+        test_cmd = _build_test_cmd(ffmpeg, encoder, hw)
+        proc = subprocess.run(test_cmd, timeout=15,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        stderr_text = proc.stderr.decode(errors="ignore").lower()
+
+        if proc.returncode != 0:
+            if hw == "qsv":
+                if any(k in stderr_text for k in ["qsv", "mfx", "intel", "vaapi"]):
+                    gpu_info["label"] += (
+                        "（QSV 初始化失败，可能原因：\n"
+                        "     ① Intel 显卡驱动版本过低或未正确安装\n"
+                        "     ② FFmpeg 打包版本不含 QSV/MediaSDK 支持\n"
+                        "     ③ 未安装 Intel Media SDK Runtime\n"
+                        "     已回退到软件编码（libx265），GPU 编码压力将降低")
+                else:
+                    gpu_info["label"] += "（QSV 硬件加速不可用，已回退到软件编码）"
+            elif hw == "cuda":
+                gpu_info["label"] += (
+                    "（NVENC 初始化失败，可能原因：\n"
+                    "     ① NVIDIA 驱动未安装或版本过低\n"
+                    "     ② FFmpeg 打包版本不含 NVENC 支持\n"
+                    "     已回退到软件编码（libx265）")
+            elif hw == "d3d11va":
+                gpu_info["label"] += (
+                    "（AMF 初始化失败，可能原因：\n"
+                    "     ① AMD 显卡驱动未正确安装\n"
+                    "     ② FFmpeg 打包版本不含 AMF 支持\n"
+                    "     已回退到软件编码（libx265）")
+            else:
+                gpu_info["label"] += "（硬件加速不可用，已回退到软件编码）"
+
+            gpu_info["encoder_h264"] = "libx264"
+            gpu_info["encoder_hevc"] = "libx265"
+            gpu_info["hwaccel"] = None
     except Exception:
         pass
 
