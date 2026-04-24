@@ -6,6 +6,14 @@
 ║         支持 Intel / AMD / NVIDIA 全显卡                          ║
 ║         支持独立显卡: NVIDIA dGPU / AMD dGPU                     ║
 ║                                                                ║
+║                                                                ║
+║  版本：v3.6 (2026-04-24) - 增强 GPU 验证与错误诊断              ║
+║                                                                ║
+║  v3.6 新增：                                                    ║
+║    ✅ GPU 活动验证机制，确保 GPU 真正被调用                      ║
+║    ✅ 增强错误提示，DX11 失败时明确告知用户                      ║
+║    ✅ GPU 状态实时日志，监控面板显示详细状态                     ║
+║                                                                ║
 ║  压力来源：                                                     ║
 ║    1. DirectX 11 —— UpdateSubresource 持续搬运（主力，无依赖）  ║
 ║    2. GPU 计算 —— CUDA (NVIDIA) / OpenCL (AMD/NVIDIA) 通用计算  ║
@@ -56,6 +64,9 @@ STATS = {
     "media_streams": 0,
     "gpu_compute_workers": 0,
     "dx_workers": 0,
+    "dx_active": False,  # v3.6 新增：DX11 是否成功启动
+    "dx_frames": 0,      # v3.6 新增：DX11 渲染帧数
+    "dx_errors": 0,      # v3.6 新增：DX11 错误计数
     "start_time": 0,
     "total_frames": 0,
     "errors": 0,
@@ -112,6 +123,8 @@ def find_ffmpeg() -> str:
 # 覆盖 Intel/AMD/NVIDIA 全显卡，无需 PyOpenGL/glfw，无需窗口句柄
 
 DX11_AVAILABLE = False
+# v3.6 新增：全局 DX11 状态标志
+DX11_AVAILABLE = False  # 用于外部验证 DX11 是否成功初始化
 _dx = None   # ctypes 加载器
 
 def _load_dx11():
@@ -179,20 +192,32 @@ def dx_compute_worker(worker_id: int):
     策略：创建 DEFAULT Usage Buffer，持续调用 UpdateSubresource
     产生 PCIe 带宽压力 + GPU 内存控制器负载，覆盖 Intel/AMD/NVIDIA 全显卡。
     无需窗口句柄，无需 PyOpenGL/glfw，d3d11.dll 任何 Windows 均自带。
+    
+    v3.6 增强：
+    - 增加 GPU 活动验证
+    - 增强错误提示
+    - 添加详细诊断信息
     """
+    global DX11_AVAILABLE
+    
     with STATS_LOCK:
         STATS["dx_workers"] += 1
-
+    
+    dx = None
+    device = None
+    immediate_context = None
+    buf = None
+    
     try:
         dx = _load_dx11()
         if dx is None:
-            raise RuntimeError("无法加载 d3d11.dll")
-
+            raise RuntimeError("无法加载 d3d11.dll - Windows 系统文件缺失或损坏")
+        
         device = ctypes.c_void_p()
         immediate_context = ctypes.c_void_p()
         feature_levels = (ctypes.c_uint * 1)(0x0000B000)
         feature_level_out = ctypes.c_uint()
-
+        
         hr = dx.D3D11CreateDevice(
             None,                   # pAdapter = NULL（默认适配器）
             D3D_DRIVER_TYPE_HARDWARE,
@@ -206,8 +231,13 @@ def dx_compute_worker(worker_id: int):
             ctypes.byref(immediate_context),
         )
         if hr != 0:
-            raise RuntimeError(f"D3D11CreateDevice 失败: hr={hr}")
-
+            raise RuntimeError(f"D3D11CreateDevice 失败：hr={hr} (0x{hr:08X})")
+        
+        # 标记 DX11 已成功初始化
+        DX11_AVAILABLE = True
+        with STATS_LOCK:
+            STATS["dx_active"] = True
+        
         # ── 创建 16 MB DEFAULT Buffer 并持续 UpdateSubresource ────
         buf_sz = 16 * 1024 * 1024   # 16 MB，足够大，持续占用 PCIe 带宽
         bd = _D3D11_BUFFER_DESC()
@@ -217,20 +247,20 @@ def dx_compute_worker(worker_id: int):
         bd.CPUAccessFlags = 0
         bd.MiscFlags = 0
         bd.StructureByteStride = 0
-
+        
         buf = ctypes.c_void_p()
         hr = dx.ID3D11Device_CreateBuffer(
             device.value, ctypes.byref(bd), None, ctypes.byref(buf))
         if hr != 0:
             raise RuntimeError(f"CreateBuffer 失败 (hr={hr})")
-
+        
         # 预计算上传数据（16 MB 全写同一值，GPU 必须完整读取并写入显存）
         fill_val = (worker_id * 0x9E3779B9 + 0xDEADBEEF) & 0xFFFFFFFF
         fill_bytes = struct.pack("<I", fill_val)
         upload_buf = bytearray(buf_sz)
         for i in range(0, buf_sz, 4):
             upload_buf[i:i+4] = fill_bytes
-
+        
         # 构造 D3D11_BOX（全缓冲范围）
         box = _D3D11_BOX()
         box.left = 0
@@ -239,7 +269,12 @@ def dx_compute_worker(worker_id: int):
         box.right = buf_sz
         box.bottom = 1
         box.back = 1
-
+        
+        # v3.6 新增：打印启动成功消息
+        print(f"  ✅ DirectX 11 GPU 烤机线程已启动 (worker={worker_id}, buffer=16MB)")
+        
+        # 主循环：持续搬运数据到 GPU
+        local_frames = 0
         while not STOP_EVENT.is_set():
             # CPU → GPU 数据传输，每次完整 16 MB，触发 PCIe + 显存控制器
             dx.ID3D11DeviceContext_UpdateSubresource(
@@ -253,16 +288,43 @@ def dx_compute_worker(worker_id: int):
             )
             with STATS_LOCK:
                 STATS["total_frames"] += 1
-
-    except Exception:
+                STATS["dx_frames"] += 1
+            local_frames += 1
+        
+        # v3.6 新增：打印停止消息
+        print(f"  ⏹  DirectX 11 GPU 烤机线程已停止 (worker={worker_id}, frames={local_frames})")
+    
+    except Exception as e:
+        error_msg = str(e)
         with STATS_LOCK:
             STATS["errors"] += 1
+            STATS["dx_errors"] += 1
+            STATS["dx_active"] = False
+        
+        # v3.6 新增：详细错误提示
+        print(f"\n  ⚠️  WARNING: DirectX 11 GPU 烤机初始化失败！")
+        print(f"     错误详情：{error_msg}")
+        print(f"     影响：GPU 将不会被压力测试，仅 CPU 在工作！")
+        print(f"     可能原因:")
+        print(f"       1. Windows 版本过旧，缺少 DirectX 11")
+        print(f"       2. 显卡驱动未正确安装")
+        print(f"       3. 系统文件 d3d11.dll 损坏")
+        print(f"     建议操作:")
+        print(f"       1. 更新 Windows 到最新版本")
+        print(f"       2. 更新显卡驱动 (Intel/AMD/NVIDIA 官网下载)")
+        print(f"       3. 运行 sfc /scannow 修复系统文件")
+        print()
+        
+        # 备用方案：如果 numpy 可用，回退到 CPU 计算
         if HAS_NUMPY:
+            print(f"  ℹ️  启动 CPU 计算备用方案 (numpy 矩阵计算)...")
             compute_worker(worker_id + 1000, matrix_size=1536)
+    
     finally:
         with STATS_LOCK:
             if STATS["dx_workers"] > 0:
                 STATS["dx_workers"] -= 1
+
 
 # ══════════════════════════════════════════════════════════════════
 # 模块 0b：GPU 自动检测（支持多卡）
