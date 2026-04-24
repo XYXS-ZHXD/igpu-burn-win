@@ -65,6 +65,8 @@ jobs:
     - name: 📂 复制 EXE 到仓库 (仅 main 分支)
       if: github.ref == 'refs/heads/main'
       run: |
+        # 确保 releases 目录存在
+        New-Item -ItemType Directory -Path releases -Force | Out-Null
         Copy-Item dist\igpu_burn_win.exe releases\igpu_burn_win.exe -Force
         Write-Host "✅ EXE 已复制到 releases/ 目录"
     
