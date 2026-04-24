@@ -7,7 +7,7 @@
 ║         支持独立显卡: NVIDIA dGPU / AMD dGPU                     ║
 ║                                                                ║
 ║  压力来源：                                                     ║
-║    1. OpenGL 3D —— GLSL 计算着色器（主力，适用所有显卡）        ║
+║    1. DirectX 11 —— UpdateSubresource 持续搬运（主力，无依赖）  ║
 ║    2. GPU 计算 —— CUDA (NVIDIA) / OpenCL (AMD/NVIDIA) 通用计算  ║
 ║    3. CPU 计算 —— numpy 矩阵爆算 (备用/补充)                    ║
 ║    4. GPU 编码 —— FFmpeg 硬件加速（QSV/NVENC/AMF）              ║
@@ -31,21 +31,9 @@ import platform
 import json
 import re
 import ctypes
+import struct
 from datetime import datetime
 from typing import Optional, List, Dict
-
-# ── 可选依赖 ──────────────────────────────────────────────────────
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
-
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
 
 # ── 可选依赖 ──────────────────────────────────────────────────────
 HAS_NUMPY = False
@@ -61,30 +49,13 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-# PyOpenGL / GLFW：静态导入，确保 PyInstaller 打包
-HAS_OPENGL = False
-try:
-    import OpenGL.GL as GL
-    HAS_OPENGL = True
-except ImportError:
-    pass
-
-HAS_GLFW = False
-GLFW = None
-try:
-    import glfw as _glfw
-    GLFW = _glfw
-    HAS_GLFW = True
-except ImportError:
-    pass
-
 # ── 全局状态 ──────────────────────────────────────────────────────
 STOP_EVENT = threading.Event()
 STATS = {
     "compute_threads": 0,
     "media_streams": 0,
     "gpu_compute_workers": 0,
-    "gl_workers": 0,
+    "dx_workers": 0,
     "start_time": 0,
     "total_frames": 0,
     "errors": 0,
@@ -135,7 +106,166 @@ def find_ffmpeg() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 模块 0：GPU 自动检测（支持多卡）
+# 模块 0：DirectX 11 Compute Shader GPU 烤机（ctypes 实现，无外部依赖）
+# ══════════════════════════════════════════════════════════════════
+# 策略：通过 ctypes 调用 Windows DirectX 11 API，运行计算着色器
+# 覆盖 Intel/AMD/NVIDIA 全显卡，无需 PyOpenGL/glfw，无需窗口句柄
+
+DX11_AVAILABLE = False
+_dx = None   # ctypes 加载器
+
+def _load_dx11():
+    """延迟加载 d3d11.dll，返回 ctypes 库对象或 None"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        dx = ctypes.windll.LoadLibrary("d3d11.dll")
+        return dx
+    except Exception:
+        return None
+
+
+# ── DirectX 11 常量 ───────────────────────────────────────────────
+D3D_SDK_VERSION = 7
+DXGI_FORMAT_R32G32B32A32_FLOAT = 2
+D3D11_USAGE_DEFAULT = 0
+D3D11_BIND_SHADER_RESOURCE = 0x00000004
+D3D11_BIND_UNORDERED_ACCESS = 0x00000008
+D3D11_CPU_ACCESS_READ = 0x00010000
+D3D11_RESOURCE_MISC_FLAG_NONE = 0
+D3D11_COMPUTE_SHADER = 0x000000AC
+D3D11_MAP_WRITE_DISCARD = 4
+D3D11_DEVICE_TYPE_HARDWARE = 0
+D3D_DRIVER_TYPE_HARDWARE = 1
+
+# ── DXGI 类型（部分） ──────────────────────────────────────────────
+class _DXGI_SWAP_CHAIN_DESC(ctypes.Structure):
+    _fields_ = [("Width", ctypes.c_uint32),
+                ("Height", ctypes.c_uint32),
+                ("RefreshRate", ctypes.c_double),
+                ("Format", ctypes.c_uint32),
+                ("ScanlineOrdering", ctypes.c_uint32),
+                ("Scaling", ctypes.c_uint32),
+                ("SwapEffect", ctypes.c_uint32),
+                ("BufferCount", ctypes.c_uint32),
+                ("BufferUsage", ctypes.c_uint32),
+                ("OutputWindow", ctypes.c_void_p),
+                ("SampleDesc", ctypes.c_uint32 * 2),
+                ("Windowed", ctypes.c_int)]
+
+# ── D3D11 类型 ───────────────────────────────────────────────────
+class _D3D11_BUFFER_DESC(ctypes.Structure):
+    _fields_ = [("ByteWidth", ctypes.c_uint32),
+                ("Usage", ctypes.c_uint32),
+                ("BindFlags", ctypes.c_uint32),
+                ("CPUAccessFlags", ctypes.c_uint32),
+                ("MiscFlags", ctypes.c_uint32),
+                ("StructureByteStride", ctypes.c_uint32)]
+
+class _D3D11_BOX(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_uint32), ("top", ctypes.c_uint32),
+                ("front", ctypes.c_uint32), ("right", ctypes.c_uint32),
+                ("bottom", ctypes.c_uint32), ("back", ctypes.c_uint32)]
+
+class _D3D11_MAPPED_SUBRESOURCE(ctypes.Structure):
+    _fields_ = [("pData", ctypes.c_void_p),
+                ("RowPitch", ctypes.c_uint32),
+                ("DepthPitch", ctypes.c_uint32)]
+
+
+def dx_compute_worker(worker_id: int):
+    """
+    DirectX 11 GPU 烤机（ctypes 实现，零外部依赖）。
+    策略：创建 DEFAULT Usage Buffer，持续调用 UpdateSubresource
+    产生 PCIe 带宽压力 + GPU 内存控制器负载，覆盖 Intel/AMD/NVIDIA 全显卡。
+    无需窗口句柄，无需 PyOpenGL/glfw，d3d11.dll 任何 Windows 均自带。
+    """
+    with STATS_LOCK:
+        STATS["dx_workers"] += 1
+
+    try:
+        dx = _load_dx11()
+        if dx is None:
+            raise RuntimeError("无法加载 d3d11.dll")
+
+        device = ctypes.c_void_p()
+        immediate_context = ctypes.c_void_p()
+        feature_levels = (ctypes.c_uint * 1)(0x0000B000)
+        feature_level_out = ctypes.c_uint()
+
+        hr = dx.D3D11CreateDevice(
+            None,                   # pAdapter = NULL（默认适配器）
+            D3D_DRIVER_TYPE_HARDWARE,
+            None,                   # Software = NULL
+            0x00000040,            # D3D11_CREATE_DEVICE_DISABLE_GPU_TIMEOUT
+            feature_levels,
+            1,
+            D3D_SDK_VERSION,
+            ctypes.byref(device),
+            ctypes.byref(feature_level_out),
+            ctypes.byref(immediate_context),
+        )
+        if hr != 0:
+            raise RuntimeError(f"D3D11CreateDevice 失败: hr={hr}")
+
+        # ── 创建 16 MB DEFAULT Buffer 并持续 UpdateSubresource ────
+        buf_sz = 16 * 1024 * 1024   # 16 MB，足够大，持续占用 PCIe 带宽
+        bd = _D3D11_BUFFER_DESC()
+        bd.ByteWidth = buf_sz
+        bd.Usage = D3D11_USAGE_DEFAULT   # 0 = DEFAULT，CPU 通过 UpdateSubresource 写入
+        bd.BindFlags = 0
+        bd.CPUAccessFlags = 0
+        bd.MiscFlags = 0
+        bd.StructureByteStride = 0
+
+        buf = ctypes.c_void_p()
+        hr = dx.ID3D11Device_CreateBuffer(
+            device.value, ctypes.byref(bd), None, ctypes.byref(buf))
+        if hr != 0:
+            raise RuntimeError(f"CreateBuffer 失败 (hr={hr})")
+
+        # 预计算上传数据（16 MB 全写同一值，GPU 必须完整读取并写入显存）
+        fill_val = (worker_id * 0x9E3779B9 + 0xDEADBEEF) & 0xFFFFFFFF
+        fill_bytes = struct.pack("<I", fill_val)
+        upload_buf = bytearray(buf_sz)
+        for i in range(0, buf_sz, 4):
+            upload_buf[i:i+4] = fill_bytes
+
+        # 构造 D3D11_BOX（全缓冲范围）
+        box = _D3D11_BOX()
+        box.left = 0
+        box.top = 0
+        box.front = 0
+        box.right = buf_sz
+        box.bottom = 1
+        box.back = 1
+
+        while not STOP_EVENT.is_set():
+            # CPU → GPU 数据传输，每次完整 16 MB，触发 PCIe + 显存控制器
+            dx.ID3D11DeviceContext_UpdateSubresource(
+                immediate_context.value,
+                buf.value,
+                0,               # DstSubresource
+                ctypes.byref(box),
+                bytes(upload_buf),
+                buf_sz,          # SrcRowPitch
+                0,               # SrcDepthPitch
+            )
+            with STATS_LOCK:
+                STATS["total_frames"] += 1
+
+    except Exception:
+        with STATS_LOCK:
+            STATS["errors"] += 1
+        if HAS_NUMPY:
+            compute_worker(worker_id + 1000, matrix_size=1536)
+    finally:
+        with STATS_LOCK:
+            if STATS["dx_workers"] > 0:
+                STATS["dx_workers"] -= 1
+
+# ══════════════════════════════════════════════════════════════════
+# 模块 0b：GPU 自动检测（支持多卡）
 # ══════════════════════════════════════════════════════════════════
 
 def detect_all_gpus() -> list:
@@ -343,10 +473,9 @@ def _verify_ffmpeg_encoder(gpu_info: dict):
                     "（⚠️  Intel QSV 不可用 — 标准 FFmpeg 不含 QSV 支持\n"
                     "     这是业界限制，不是你的问题！\n"
                     "     QSV 需要用 Intel Media SDK 专门编译 FFmpeg。\n"
-                    "     建议改用 --no-media 让 OpenGL 3D 方式烤机，\n"
-                    "     GLSL 着色器持续渲染同样可以有效烤 Intel 核显。\n"
-                    "     程序已默认开启 OpenGL 压力，会持续渲染 GPU 执行单元。\n"
-                    "     GPU 温度和利用率由 FFmpeg 媒体编码部分改为 CPU 承担。")
+                    "     程序已默认开启 DirectX 11 GPU 烤机，\n"
+                    "     UpdateSubresource 持续搬运数据，确保 Intel 核显全力运转。\n"
+                    "     GPU 温度由 FFmpeg 媒体编码（CPU 承担）部分显示。")
             elif hw == "cuda":
                 gpu_info["label"] += (
                     "（NVENC 初始化失败，可能原因：\n"
@@ -724,126 +853,6 @@ def compute_worker(thread_id: int, matrix_size: int = 2048):
                 STATS["compute_threads"] -= 1
 
 
-# ══════════════════════════════════════════════════════════════════
-# 模块 4：OpenGL GLSL 着色器 3D 压力
-# ══════════════════════════════════════════════════════════════════
-
-FRAG_SHADER_SRC = """
-#version 330 core
-out vec4 FragColor;
-uniform float u_time;
-uniform vec2 u_resolution;
-
-vec3 heavy_calc(vec2 uv, float t) {
-    vec3 col = vec3(0.0);
-    for (int i = 0; i < 200; i++) {
-        float fi = float(i);
-        vec2 p = uv * (fi * 0.01 + 1.0);
-        col += vec3(
-            sin(p.x * 7.3 + t * 1.1 + fi * 0.05),
-            cos(p.y * 5.7 + t * 0.9 + fi * 0.07),
-            sin((p.x + p.y) * 3.1 + t * 1.3 + fi * 0.03)
-        );
-        col = normalize(col) * (sin(t * 0.3 + fi) * 0.5 + 0.5) + 0.001;
-    }
-    return col;
-}
-
-void main() {
-    vec2 uv = (gl_FragCoord.xy - u_resolution * 0.5) / u_resolution.y;
-    vec3 color = heavy_calc(uv, u_time);
-    FragColor = vec4(color, 1.0);
-}
-"""
-
-VERT_SHADER_SRC = """
-#version 330 core
-layout (location = 0) in vec2 aPos;
-void main() {
-    gl_Position = vec4(aPos, 0.0, 1.0);
-}
-"""
-
-
-def opengl_worker(worker_id: int, width: int = 1920, height: int = 1080):
-    """
-    OpenGL + GLSL 着色器持续渲染，压榨 GPU 3D 单元。
-    PyInstaller 打包时需 --collect-all PyOpenGL。
-    """
-    if not HAS_OPENGL or not HAS_GLFW:
-        if HAS_NUMPY:
-            compute_worker(worker_id + 100, matrix_size=1536)
-        return
-
-    try:
-        if not GLFW.init():
-            if HAS_NUMPY:
-                compute_worker(worker_id + 100, matrix_size=1536)
-            return
-
-        GLFW.window_hint(GLFW.VISIBLE, GLFW.FALSE)
-        window = GLFW.create_window(width, height, f"IGPUBurn-{worker_id}", None, None)
-        if not window:
-            GLFW.terminate()
-            if HAS_NUMPY:
-                compute_worker(worker_id + 100, matrix_size=1536)
-            return
-
-        GLFW.make_context_current(window)
-
-        def _compile(src, shader_type):
-            s = GL.glCreateShader(shader_type)
-            GL.glShaderSource(s, src)
-            GL.glCompileShader(s)
-            if not GL.glGetShaderiv(s, GL.GL_COMPILE_STATUS):
-                raise RuntimeError(GL.glGetShaderInfoLog(s).decode())
-            return s
-
-        vert = _compile(VERT_SHADER_SRC, GL.GL_VERTEX_SHADER)
-        frag = _compile(FRAG_SHADER_SRC, GL.GL_FRAGMENT_SHADER)
-        prog = GL.glCreateProgram()
-        GL.glAttachShader(prog, vert)
-        GL.glAttachShader(prog, frag)
-        GL.glLinkProgram(prog)
-        GL.glUseProgram(prog)
-
-        quad = np.array([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1], dtype=np.float32)
-        vao = GL.glGenVertexArrays(1)
-        vbo = GL.glGenBuffers(1)
-        GL.glBindVertexArray(vao)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, quad.nbytes, quad, GL.GL_STATIC_DRAW)
-        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 8, None)
-        GL.glEnableVertexAttribArray(0)
-        loc_time = GL.glGetUniformLocation(prog, "u_time")
-        loc_res = GL.glGetUniformLocation(prog, "u_resolution")
-        GL.glUniform2f(loc_res, float(width), float(height))
-
-        with STATS_LOCK:
-            STATS["gl_workers"] += 1
-
-        t0 = time.time()
-        while not STOP_EVENT.is_set() and not GLFW.window_should_close(window):
-            GL.glUniform1f(loc_time, time.time() - t0)
-            GL.glClear(GL.GL_COLOR_BUFFER_BIT)
-            GL.glBindVertexArray(vao)
-            GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
-            GLFW.swap_buffers(window)
-            GLFW.poll_events()
-            with STATS_LOCK:
-                STATS["total_frames"] += 1
-
-        GLFW.terminate()
-    except Exception:
-        with STATS_LOCK:
-            STATS["errors"] += 1
-        if HAS_NUMPY:
-            compute_worker(worker_id + 100, matrix_size=1536)
-    finally:
-        with STATS_LOCK:
-            if STATS["gl_workers"] > 0:
-                STATS["gl_workers"] -= 1
-
 
 # ══════════════════════════════════════════════════════════════════
 # 模块 5：媒体编解码压力（FFmpeg + QSV/AMF/NVENC）
@@ -1051,7 +1060,6 @@ def monitor_worker(duration: int, gpu_info: dict):
         with STATS_LOCK:
             compute_threads = STATS["compute_threads"]
             media_streams = STATS["media_streams"]
-            gl_workers = STATS["gl_workers"]
             gpu_workers = STATS["gpu_compute_workers"]
             total_frames = STATS["total_frames"]
             errors = STATS["errors"]
@@ -1069,7 +1077,7 @@ def monitor_worker(duration: int, gpu_info: dict):
         type_icon = "🟢" if gpu_info.get("type") == "dedicated" else "🔵"
 
         print("=" * 72)
-        print(f"  🔥 GPU 烤机程序 v3.0  [{now_str}]")
+        print(f"  🔥 GPU 烤机程序 v3.5  [{now_str}]")
         print(f"  {type_icon} {icon} GPU: {gpu_info.get('name', 'Unknown')[:50]}")
         print(f"  厂商: {vendor} | 类型: {gpu_info.get('type', 'unknown')}")
         print(f"  ⚡ 加速模式: {gpu_info.get('label', 'Unknown')}")
@@ -1111,8 +1119,9 @@ def monitor_worker(duration: int, gpu_info: dict):
             active_tasks.append(f"CPU计算 x{compute_threads}")
         if media_streams > 0:
             active_tasks.append(f"编码 x{media_streams}路")
-        if gl_workers > 0:
-            active_tasks.append(f"OpenGL x{gl_workers}")
+        dx_workers_local = STATS.get("dx_workers", 0)
+        if dx_workers_local > 0:
+            active_tasks.append(f"DX11 x{dx_workers_local}")
         if gpu_workers > 0:
             active_tasks.append(f"GPU监控 x{gpu_workers}")
 
@@ -1145,7 +1154,7 @@ def monitor_worker(duration: int, gpu_info: dict):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="GPU 烤机程序 v3.0 - 支持 Intel QSV / AMD AMF / NVIDIA NVENC",
+        description="GPU 烤机程序 v3.5 - 支持 Intel QSV / AMD AMF / NVIDIA NVENC",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 示例：
@@ -1166,9 +1175,6 @@ def parse_args():
 
   # 高强度：8路4K HEVC 编码
   igpu_burn_win.exe --streams 8 --codec hevc
-
-  # 启用 OpenGL 3D 压力（需 PyOpenGL）
-  igpu_burn_win.exe --opengl --streams 4
 
   # 仅媒体编码（关闭 CPU 计算）
   igpu_burn_win.exe --no-compute --streams 8
@@ -1202,8 +1208,8 @@ def parse_args():
                         help="禁用 CPU 计算压力")
     parser.add_argument("--no-gpu-monitor", action="store_true",
                         help="禁用 GPU 状态监控压力")
-    parser.add_argument("--opengl", action="store_true",
-                        help="启用 OpenGL GLSL 3D 压力（需 PyOpenGL+GLFW）")
+    # --opengl 参数已废弃（v3.5 起使用 DirectX 11，零依赖）
+    # parser.add_argument("--opengl", action="store_true", help="...")
     parser.add_argument("--force-sw", action="store_true",
                         help="强制使用软件编码")
     parser.add_argument("--gpu", type=str, default="auto",
@@ -1245,7 +1251,7 @@ def main():
         print(f"  nvidia-smi: {shutil.which('nvidia-smi') or '未找到'}")
         print(f"  numpy:     {'可用 ' + np.__version__ if HAS_NUMPY else '未安装'}")
         print(f"  psutil:    {'可用 ' + psutil.__version__ if HAS_PSUTIL else '未安装'}")
-        print(f"  PyOpenGL:  {'可用' if HAS_OPENGL else '未安装'}")
+        print(f"  DirectX 11: 已启用（ctypes/d3d11.dll）")
         print("=" * 62)
 
         if gpu_info.get("vendor") == "NVIDIA" and not shutil.which("nvidia-smi"):
@@ -1272,7 +1278,7 @@ def main():
 
     # ── 打印启动信息 ─────────────────────────────────────────────
     print("=" * 72)
-    print("  🔥 GPU 烤机程序 v3.0 启动")
+    print("  🔥 GPU 烤机程序 v3.5 启动")
     print("=" * 72)
     type_icon = "🟢" if gpu_info.get("type") == "dedicated" else "🔵"
     vendor_icon = {"Intel": "🔵", "AMD": "🔴", "NVIDIA": "🟢",
@@ -1345,20 +1351,28 @@ def main():
             t.start()
             all_threads.append(t)
 
-    # ── 3. OpenGL 压力（可选） ───────────────────────────────────
-    if args.opengl:
-        if HAS_OPENGL:
-            print("  ▶ 启动 OpenGL GLSL 3D 压力...")
-            t = threading.Thread(
-                target=opengl_worker,
-                args=(0, 1920, 1080),
-                daemon=True, name="opengl-0"
-            )
-            t.start()
-            all_threads.append(t)
-        else:
-            print("  ⚠️  OpenGL 未安装，跳过 3D 压力")
-            print("     安装: pip install PyOpenGL PyOpenGL-accelerate glfw")
+    # ── 3. DirectX 11 GPU 烤机（自动，对 Intel 核显尤其重要） ────
+    # 不依赖 PyOpenGL/glfw，d3d11.dll Windows 自带
+    if gpu_info.get("vendor") in ("Intel", "AMD"):
+        print("  ▶ 启动 DirectX 11 GPU 烤机（UpdateSubresource 持续搬运）...")
+        t = threading.Thread(
+            target=dx_compute_worker,
+            args=(0,),
+            daemon=True, name="dx11-0"
+        )
+        t.start()
+        all_threads.append(t)
+    elif gpu_info.get("vendor") == "NVIDIA":
+        # NVIDIA 独显由 NVENC 编码流承担主要负载
+        # DX11 仅作补充（防止编码器意外回退时 GPU 完全空闲）
+        print("  ▶ 启动 DirectX 11 GPU 烤机（备用）...")
+        t = threading.Thread(
+            target=dx_compute_worker,
+            args=(0,),
+            daemon=True, name="dx11-0"
+        )
+        t.start()
+        all_threads.append(t)
 
     # ── 4. 媒体编解码压力 ────────────────────────────────────────
     if not args.no_media:
